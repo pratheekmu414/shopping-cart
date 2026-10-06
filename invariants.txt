@@ -1,0 +1,39 @@
+Product
+
+Product count cannot go below 0; total available units count >= total sold units count
+Product count is to be reduced only upon successful order creation (never on a failed checkout, and it can't be reduced twice upon retry)
+
+Cart
+
+Cart → list of products with count > 0
+A cart is either being used or has been checked out, i.e., OPEN or CHECKED_OUT
+
+Order
+
+A single checkout, with all its retries, should result in at most 1 order, not more
+Since it's a snapshot of sorts (and should not be changed), it keeps its own copy of product units, unit price, qty, line totals, discount ...
+Order total >= 0 always; it can't be made negative with a discount
+
+Coupon
+
+Can be availed by at most 1 order
+Remains unaffected by failed checkouts and should still be available for subsequent checkout retries
+Each milestone → max 1 coupon; a coupon is to be generated only if that milestone has actually been hit
+A coupon stores its own discount %, so changing x doesn't affect issued coupons
+A coupon stores the order count that earned it
+Next milestone = last rewarded + n, so changing n only affects future milestones
+Checkout uses the coupon's %, not the current x
+
+Note:
+
+This depends on whether a reached milestone is an eligibility (the admin has the discretion to generate the coupon or choose not to) or a guarantee (the customer is entitled to the coupon)
+I have made the assumption that when n or x changes, the change only applies going forward. Each coupon keeps the discount % it was created with, and the next milestone is counted from the last rewarded one.
+Before setting a new n, we might have to generate coupons for all reached but unclaimed milestones under the old n, then switch.
+
+Report
+
+units sold per product = sum of qty across order lines
+gross = sum of subtotals
+discounts = sum of order discounts
+net = gross − discounts = sum of order totals
+coupons generated = available + redeemed (+ expired, if I add expiry)
