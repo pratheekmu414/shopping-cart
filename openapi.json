@@ -1,0 +1,2110 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Checkout & Rewards",
+    "description": "\nBackend for a small store: carts, idempotent checkout, and a rewards program that issues a\ndiscount coupon after every *n*-th successfully placed order.\n\n## Conventions\n- **Money is an integer in the currency's minor unit** in every field named `*_minor`, with the ISO 4217\n  code in a `currency` field next to it: `{\"price_minor\": 8999, \"currency\": \"INR\"}` is \u20b989.99. The minor unit is\n  paise for INR, cents for USD and yen for JPY (no decimals). There are no floats anywhere.\n- **One currency per store**, set with the `CURRENCY` setting. Each order keeps the currency it was\n  placed in, so changing the setting later never re-labels past orders.\n- **Every error has the same shape.** Branch on `error.code`, not on `message` or the HTTP status alone:\n  ```json\n  {\"error\": {\"code\": \"INSUFFICIENT_INVENTORY\", \"message\": \"...\", \"details\": {...}}}\n  ```\n  - `404`: the resource in the path doesn't exist.\n  - `409`: the request is valid but conflicts with current state. Retrying won't help until the state changes.\n  - `422`: the request itself is wrong.\n- **Request bodies reject unknown fields**, so `{\"coupon\": \"...\"}` (a typo for `coupon_code`)\n  fails loudly instead of silently checking out at full price.\n\n## Retries and concurrency\n- **Checkout is idempotent per cart.** Retrying `POST /carts/{cart_id}/checkout` with the same body returns\n  the original order (`200`) instead of creating a second one (`201` the first time). A cart becomes at most one order.\n- `PUT` and `DELETE` on cart items are safe to retry. `POST /carts/{cart_id}/items` returns\n  `409 ITEM_ALREADY_IN_CART` on a retry rather than doubling the quantity.\n- Concurrent checkouts **never oversell** and a coupon is **never redeemed twice**. A checkout that fails\n  changes nothing: no stock is taken and the coupon stays available.\n\n## Prices\nCarts always show **current** prices. The price is fixed at checkout, and the order keeps its own copy, so later\nproduct changes never alter a placed order. Send `expected_total_minor` at checkout to refuse a total\nthe customer hasn't seen.\n\n## Administration\nOperations under `/admin` are administrative. Authentication is out of scope for this exercise;\nin production they would require an admin role.\n",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/products": {
+      "get": {
+        "tags": [
+          "Products"
+        ],
+        "summary": "List products",
+        "operationId": "list_products_products_get",
+        "responses": {
+          "200": {
+            "description": "All products with current price and stock.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/Product"
+                  },
+                  "type": "array",
+                  "title": "Response List Products Products Get"
+                },
+                "examples": {
+                  "seed": {
+                    "summary": "Seed catalogue",
+                    "value": [
+                      {
+                        "id": "p_cable",
+                        "name": "USB-C Cable",
+                        "price_minor": 999,
+                        "currency": "INR",
+                        "inventory": 500
+                      },
+                      {
+                        "id": "p_keyboard",
+                        "name": "Mechanical Keyboard",
+                        "price_minor": 8999,
+                        "currency": "INR",
+                        "inventory": 50
+                      },
+                      {
+                        "id": "p_lamp",
+                        "name": "Limited Edition Desk Lamp",
+                        "price_minor": 14999,
+                        "currency": "INR",
+                        "inventory": 3
+                      },
+                      {
+                        "id": "p_monitor",
+                        "name": "27in Monitor",
+                        "price_minor": 27999,
+                        "currency": "INR",
+                        "inventory": 20
+                      },
+                      {
+                        "id": "p_mouse",
+                        "name": "Wireless Mouse",
+                        "price_minor": 2499,
+                        "currency": "INR",
+                        "inventory": 100
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/carts": {
+      "post": {
+        "tags": [
+          "Carts"
+        ],
+        "summary": "Create a cart",
+        "description": "Creates an empty cart. Not idempotent, but a duplicate just leaves an unused empty cart behind.",
+        "operationId": "create_cart_carts_post",
+        "responses": {
+          "201": {
+            "description": "The new, empty cart.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Cart"
+                },
+                "examples": {
+                  "empty": {
+                    "summary": "Empty cart",
+                    "value": {
+                      "id": "b685d68c87cb40ffbb3c88af5c8cdfad",
+                      "status": "open",
+                      "items": [],
+                      "subtotal_minor": 0,
+                      "currency": "INR"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/carts/{cart_id}": {
+      "get": {
+        "tags": [
+          "Carts"
+        ],
+        "summary": "View a cart",
+        "description": "Lines show the current unit price, current stock and an `in_stock` flag, so a UI can warn before\ncheckout. Prices aren't locked in until checkout.",
+        "operationId": "get_cart_carts__cart_id__get",
+        "parameters": [
+          {
+            "name": "cart_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Cart ID returned by `POST /carts`.",
+              "examples": [
+                "b685d68c87cb40ffbb3c88af5c8cdfad"
+              ],
+              "title": "Cart Id"
+            },
+            "description": "Cart ID returned by `POST /carts`."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The cart, priced at **current** product prices.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Cart"
+                },
+                "examples": {
+                  "open": {
+                    "summary": "Open cart",
+                    "value": {
+                      "id": "b685d68c87cb40ffbb3c88af5c8cdfad",
+                      "status": "open",
+                      "items": [
+                        {
+                          "product_id": "p_cable",
+                          "name": "USB-C Cable",
+                          "unit_price_minor": 999,
+                          "quantity": 2,
+                          "line_total_minor": 1998,
+                          "available_inventory": 500,
+                          "in_stock": true
+                        },
+                        {
+                          "product_id": "p_keyboard",
+                          "name": "Mechanical Keyboard",
+                          "unit_price_minor": 8999,
+                          "quantity": 1,
+                          "line_total_minor": 8999,
+                          "available_inventory": 50,
+                          "in_stock": true
+                        }
+                      ],
+                      "subtotal_minor": 10997,
+                      "currency": "INR"
+                    }
+                  },
+                  "out_of_stock": {
+                    "summary": "Stock dropped after the item was added",
+                    "value": {
+                      "id": "b685d68c87cb40ffbb3c88af5c8cdfad",
+                      "status": "open",
+                      "subtotal_minor": 44997,
+                      "currency": "INR",
+                      "items": [
+                        {
+                          "product_id": "p_lamp",
+                          "name": "Limited Edition Desk Lamp",
+                          "unit_price_minor": 14999,
+                          "quantity": 3,
+                          "line_total_minor": 44997,
+                          "available_inventory": 2,
+                          "in_stock": false
+                        }
+                      ]
+                    }
+                  },
+                  "checked_out": {
+                    "summary": "Cart after checkout",
+                    "value": {
+                      "id": "b685d68c87cb40ffbb3c88af5c8cdfad",
+                      "status": "checked_out",
+                      "order_id": "bb5df4bff6d1471cb976cb781c95a385",
+                      "items": [
+                        {
+                          "product_id": "p_cable",
+                          "name": "USB-C Cable",
+                          "unit_price_minor": 999,
+                          "quantity": 2,
+                          "line_total_minor": 1998,
+                          "available_inventory": 500,
+                          "in_stock": true
+                        },
+                        {
+                          "product_id": "p_keyboard",
+                          "name": "Mechanical Keyboard",
+                          "unit_price_minor": 8999,
+                          "quantity": 1,
+                          "line_total_minor": 8999,
+                          "available_inventory": 50,
+                          "in_stock": true
+                        }
+                      ],
+                      "subtotal_minor": 10997,
+                      "currency": "INR"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "CART_NOT_FOUND": {
+                    "summary": "Unknown cart ID",
+                    "value": {
+                      "error": {
+                        "code": "CART_NOT_FOUND",
+                        "message": "Cart 0d4c6b1e9f2a4e7c8b3d5a6f1e2c9b70 does not exist",
+                        "details": {}
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/carts/{cart_id}/items": {
+      "post": {
+        "tags": [
+          "Carts"
+        ],
+        "summary": "Add an item",
+        "description": "Adds a product that isn't in the cart yet. If it's already there, this returns `409 ITEM_ALREADY_IN_CART`\ninstead of adding more, so a retried request can't double the quantity. Use `PUT` to change a quantity.\n\nThe stock check here is advisory: carts don't reserve stock, and checkout re-checks it.",
+        "operationId": "add_item_carts__cart_id__items_post",
+        "parameters": [
+          {
+            "name": "cart_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Cart ID returned by `POST /carts`.",
+              "examples": [
+                "b685d68c87cb40ffbb3c88af5c8cdfad"
+              ],
+              "title": "Cart Id"
+            },
+            "description": "Cart ID returned by `POST /carts`."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddItem"
+              },
+              "examples": {
+                "keyboard": {
+                  "summary": "Add one keyboard",
+                  "value": {
+                    "product_id": "p_keyboard",
+                    "quantity": 1
+                  }
+                },
+                "limited": {
+                  "summary": "Add the limited-stock lamp",
+                  "value": {
+                    "product_id": "p_lamp",
+                    "quantity": 2
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The updated cart.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Cart"
+                },
+                "examples": {
+                  "added": {
+                    "summary": "Item added",
+                    "value": {
+                      "id": "b685d68c87cb40ffbb3c88af5c8cdfad",
+                      "status": "open",
+                      "items": [
+                        {
+                          "product_id": "p_cable",
+                          "name": "USB-C Cable",
+                          "unit_price_minor": 999,
+                          "quantity": 2,
+                          "line_total_minor": 1998,
+                          "available_inventory": 500,
+                          "in_stock": true
+                        },
+                        {
+                          "product_id": "p_keyboard",
+                          "name": "Mechanical Keyboard",
+                          "unit_price_minor": 8999,
+                          "quantity": 1,
+                          "line_total_minor": 8999,
+                          "available_inventory": 50,
+                          "in_stock": true
+                        }
+                      ],
+                      "subtotal_minor": 10997,
+                      "currency": "INR"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "CART_NOT_FOUND": {
+                    "summary": "Unknown cart ID",
+                    "value": {
+                      "error": {
+                        "code": "CART_NOT_FOUND",
+                        "message": "Cart 0d4c6b1e9f2a4e7c8b3d5a6f1e2c9b70 does not exist",
+                        "details": {}
+                      }
+                    }
+                  },
+                  "PRODUCT_NOT_FOUND": {
+                    "summary": "Unknown product ID",
+                    "value": {
+                      "error": {
+                        "code": "PRODUCT_NOT_FOUND",
+                        "message": "Product p_speaker does not exist",
+                        "details": {}
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict with current state",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "ITEM_ALREADY_IN_CART": {
+                    "summary": "Product already in the cart (use PUT)",
+                    "value": {
+                      "error": {
+                        "code": "ITEM_ALREADY_IN_CART",
+                        "message": "Product already in cart; use PUT to change its quantity",
+                        "details": {}
+                      }
+                    }
+                  },
+                  "INSUFFICIENT_INVENTORY_ADD": {
+                    "summary": "More than is in stock right now",
+                    "value": {
+                      "error": {
+                        "code": "INSUFFICIENT_INVENTORY",
+                        "message": "Not enough inventory for requested quantity",
+                        "details": {
+                          "items": [
+                            {
+                              "product_id": "p_lamp",
+                              "requested": 4,
+                              "available": 3
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  },
+                  "CART_ALREADY_CHECKED_OUT": {
+                    "summary": "Cart is frozen after checkout",
+                    "value": {
+                      "error": {
+                        "code": "CART_ALREADY_CHECKED_OUT",
+                        "message": "Cart has already been checked out",
+                        "details": {
+                          "order_id": "bb5df4bff6d1471cb976cb781c95a385"
+                        }
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "VALIDATION_ERROR": {
+                    "summary": "Quantity out of range",
+                    "value": {
+                      "error": {
+                        "code": "VALIDATION_ERROR",
+                        "message": "Request body is invalid",
+                        "details": {
+                          "errors": [
+                            {
+                              "type": "greater_than",
+                              "loc": [
+                                "body",
+                                "quantity"
+                              ],
+                              "msg": "Input should be greater than 0",
+                              "input": 0,
+                              "ctx": {
+                                "gt": 0
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  },
+                  "VALIDATION_ERROR_EXTRA": {
+                    "summary": "Unknown field in the body",
+                    "value": {
+                      "error": {
+                        "code": "VALIDATION_ERROR",
+                        "message": "Request body is invalid",
+                        "details": {
+                          "errors": [
+                            {
+                              "type": "extra_forbidden",
+                              "loc": [
+                                "body",
+                                "coupon"
+                              ],
+                              "msg": "Extra inputs are not permitted",
+                              "input": "SAVE-7F3A9C21"
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/carts/{cart_id}/items/{product_id}": {
+      "put": {
+        "tags": [
+          "Carts"
+        ],
+        "summary": "Set an item's quantity",
+        "description": "Sets the quantity, adding the item if it isn't in the cart yet. Safe to retry.",
+        "operationId": "set_item_carts__cart_id__items__product_id__put",
+        "parameters": [
+          {
+            "name": "cart_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Cart ID returned by `POST /carts`.",
+              "examples": [
+                "b685d68c87cb40ffbb3c88af5c8cdfad"
+              ],
+              "title": "Cart Id"
+            },
+            "description": "Cart ID returned by `POST /carts`."
+          },
+          {
+            "name": "product_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Product ID, e.g. `p_keyboard`.",
+              "examples": [
+                "p_keyboard"
+              ],
+              "title": "Product Id"
+            },
+            "description": "Product ID, e.g. `p_keyboard`."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetQuantity"
+              },
+              "examples": {
+                "two": {
+                  "summary": "Set quantity to 2",
+                  "value": {
+                    "quantity": 2
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The updated cart.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Cart"
+                },
+                "examples": {
+                  "updated": {
+                    "summary": "Quantity set",
+                    "value": {
+                      "id": "b685d68c87cb40ffbb3c88af5c8cdfad",
+                      "status": "open",
+                      "items": [
+                        {
+                          "product_id": "p_cable",
+                          "name": "USB-C Cable",
+                          "unit_price_minor": 999,
+                          "quantity": 2,
+                          "line_total_minor": 1998,
+                          "available_inventory": 500,
+                          "in_stock": true
+                        },
+                        {
+                          "product_id": "p_keyboard",
+                          "name": "Mechanical Keyboard",
+                          "unit_price_minor": 8999,
+                          "quantity": 1,
+                          "line_total_minor": 8999,
+                          "available_inventory": 50,
+                          "in_stock": true
+                        }
+                      ],
+                      "subtotal_minor": 10997,
+                      "currency": "INR"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "CART_NOT_FOUND": {
+                    "summary": "Unknown cart ID",
+                    "value": {
+                      "error": {
+                        "code": "CART_NOT_FOUND",
+                        "message": "Cart 0d4c6b1e9f2a4e7c8b3d5a6f1e2c9b70 does not exist",
+                        "details": {}
+                      }
+                    }
+                  },
+                  "PRODUCT_NOT_FOUND": {
+                    "summary": "Unknown product ID",
+                    "value": {
+                      "error": {
+                        "code": "PRODUCT_NOT_FOUND",
+                        "message": "Product p_speaker does not exist",
+                        "details": {}
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict with current state",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "INSUFFICIENT_INVENTORY_ADD": {
+                    "summary": "More than is in stock right now",
+                    "value": {
+                      "error": {
+                        "code": "INSUFFICIENT_INVENTORY",
+                        "message": "Not enough inventory for requested quantity",
+                        "details": {
+                          "items": [
+                            {
+                              "product_id": "p_lamp",
+                              "requested": 4,
+                              "available": 3
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  },
+                  "CART_ALREADY_CHECKED_OUT": {
+                    "summary": "Cart is frozen after checkout",
+                    "value": {
+                      "error": {
+                        "code": "CART_ALREADY_CHECKED_OUT",
+                        "message": "Cart has already been checked out",
+                        "details": {
+                          "order_id": "bb5df4bff6d1471cb976cb781c95a385"
+                        }
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "VALIDATION_ERROR": {
+                    "summary": "Quantity out of range",
+                    "value": {
+                      "error": {
+                        "code": "VALIDATION_ERROR",
+                        "message": "Request body is invalid",
+                        "details": {
+                          "errors": [
+                            {
+                              "type": "greater_than",
+                              "loc": [
+                                "body",
+                                "quantity"
+                              ],
+                              "msg": "Input should be greater than 0",
+                              "input": 0,
+                              "ctx": {
+                                "gt": 0
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Carts"
+        ],
+        "summary": "Remove an item",
+        "description": "Removes the item. Removing an item that isn't in the cart also returns `200`, so retries are safe.",
+        "operationId": "remove_item_carts__cart_id__items__product_id__delete",
+        "parameters": [
+          {
+            "name": "cart_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Cart ID returned by `POST /carts`.",
+              "examples": [
+                "b685d68c87cb40ffbb3c88af5c8cdfad"
+              ],
+              "title": "Cart Id"
+            },
+            "description": "Cart ID returned by `POST /carts`."
+          },
+          {
+            "name": "product_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Product ID, e.g. `p_keyboard`.",
+              "examples": [
+                "p_keyboard"
+              ],
+              "title": "Product Id"
+            },
+            "description": "Product ID, e.g. `p_keyboard`."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The updated cart.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Cart"
+                },
+                "examples": {
+                  "removed": {
+                    "summary": "Item removed",
+                    "value": {
+                      "id": "b685d68c87cb40ffbb3c88af5c8cdfad",
+                      "status": "open",
+                      "items": [],
+                      "subtotal_minor": 0,
+                      "currency": "INR"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "CART_NOT_FOUND": {
+                    "summary": "Unknown cart ID",
+                    "value": {
+                      "error": {
+                        "code": "CART_NOT_FOUND",
+                        "message": "Cart 0d4c6b1e9f2a4e7c8b3d5a6f1e2c9b70 does not exist",
+                        "details": {}
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict with current state",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "CART_ALREADY_CHECKED_OUT": {
+                    "summary": "Cart is frozen after checkout",
+                    "value": {
+                      "error": {
+                        "code": "CART_ALREADY_CHECKED_OUT",
+                        "message": "Cart has already been checked out",
+                        "details": {
+                          "order_id": "bb5df4bff6d1471cb976cb781c95a385"
+                        }
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/carts/{cart_id}/checkout": {
+      "post": {
+        "tags": [
+          "Checkout & orders"
+        ],
+        "summary": "Check out a cart",
+        "description": "Validates the cart and places the order in a single transaction. Either all of it happens\n(order created, stock taken, coupon redeemed) or none of it does.\n\n- **Idempotent per cart:** retrying with the same `coupon_code` returns the original order with `200`.\n  A retry with a *different* coupon is a new request and gets `409 CART_ALREADY_CHECKED_OUT`.\n- **All or nothing:** if any line is short on stock, the whole checkout fails and nothing changes.\n- **Concurrency:** concurrent checkouts never oversell, and a coupon is redeemed by exactly one of them.\n- **Prices** are taken at this moment and copied into the order.",
+        "operationId": "checkout_cart_carts__cart_id__checkout_post",
+        "parameters": [
+          {
+            "name": "cart_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Cart ID returned by `POST /carts`.",
+              "examples": [
+                "b685d68c87cb40ffbb3c88af5c8cdfad"
+              ],
+              "title": "Cart Id"
+            },
+            "description": "Cart ID returned by `POST /carts`."
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/CheckoutBody"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              },
+              "examples": {
+                "plain": {
+                  "summary": "No coupon",
+                  "value": {}
+                },
+                "coupon": {
+                  "summary": "With a coupon",
+                  "value": {
+                    "coupon_code": "SAVE-7F3A9C21"
+                  }
+                },
+                "guarded": {
+                  "summary": "Refuse if the total changed",
+                  "description": "The client showed the customer \u20b998.97 (9897 paise). If prices moved since, checkout is refused.",
+                  "value": {
+                    "coupon_code": "SAVE-7F3A9C21",
+                    "expected_total_minor": 9897
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Order placed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Order"
+                },
+                "examples": {
+                  "plain": {
+                    "summary": "Without a coupon",
+                    "value": {
+                      "id": "bb5df4bff6d1471cb976cb781c95a385",
+                      "cart_id": "b685d68c87cb40ffbb3c88af5c8cdfad",
+                      "subtotal_minor": 10997,
+                      "discount_percent": 0,
+                      "discount_minor": 0,
+                      "total_minor": 10997,
+                      "currency": "INR",
+                      "created_at": "2026-10-06T18:26:10.303402Z",
+                      "lines": [
+                        {
+                          "product_id": "p_cable",
+                          "product_name": "USB-C Cable",
+                          "unit_price_minor": 999,
+                          "quantity": 2,
+                          "line_total_minor": 1998
+                        },
+                        {
+                          "product_id": "p_keyboard",
+                          "product_name": "Mechanical Keyboard",
+                          "unit_price_minor": 8999,
+                          "quantity": 1,
+                          "line_total_minor": 8999
+                        }
+                      ]
+                    }
+                  },
+                  "coupon": {
+                    "summary": "With a 10% coupon",
+                    "value": {
+                      "id": "bb5df4bff6d1471cb976cb781c95a385",
+                      "cart_id": "b685d68c87cb40ffbb3c88af5c8cdfad",
+                      "subtotal_minor": 10997,
+                      "coupon_code": "SAVE-7F3A9C21",
+                      "discount_percent": 10,
+                      "discount_minor": 1100,
+                      "total_minor": 9897,
+                      "currency": "INR",
+                      "created_at": "2026-10-06T18:26:10.303402Z",
+                      "lines": [
+                        {
+                          "product_id": "p_cable",
+                          "product_name": "USB-C Cable",
+                          "unit_price_minor": 999,
+                          "quantity": 2,
+                          "line_total_minor": 1998
+                        },
+                        {
+                          "product_id": "p_keyboard",
+                          "product_name": "Mechanical Keyboard",
+                          "unit_price_minor": 8999,
+                          "quantity": 1,
+                          "line_total_minor": 8999
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Retry of a checkout that already succeeded: the **original** order is returned and nothing is charged again.",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "replay": {
+                    "summary": "Replayed order",
+                    "value": {
+                      "id": "bb5df4bff6d1471cb976cb781c95a385",
+                      "cart_id": "b685d68c87cb40ffbb3c88af5c8cdfad",
+                      "subtotal_minor": 10997,
+                      "coupon_code": "SAVE-7F3A9C21",
+                      "discount_percent": 10,
+                      "discount_minor": 1100,
+                      "total_minor": 9897,
+                      "currency": "INR",
+                      "created_at": "2026-10-06T18:26:10.303402Z",
+                      "lines": [
+                        {
+                          "product_id": "p_cable",
+                          "product_name": "USB-C Cable",
+                          "unit_price_minor": 999,
+                          "quantity": 2,
+                          "line_total_minor": 1998
+                        },
+                        {
+                          "product_id": "p_keyboard",
+                          "product_name": "Mechanical Keyboard",
+                          "unit_price_minor": 8999,
+                          "quantity": 1,
+                          "line_total_minor": 8999
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "CART_NOT_FOUND": {
+                    "summary": "Unknown cart ID",
+                    "value": {
+                      "error": {
+                        "code": "CART_NOT_FOUND",
+                        "message": "Cart 0d4c6b1e9f2a4e7c8b3d5a6f1e2c9b70 does not exist",
+                        "details": {}
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict with current state",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "CART_CHECKED_OUT_DIFFERENT_COUPON": {
+                    "summary": "Cart already placed with a different coupon",
+                    "value": {
+                      "error": {
+                        "code": "CART_ALREADY_CHECKED_OUT",
+                        "message": "Cart was already checked out with a different coupon",
+                        "details": {
+                          "order_id": "bb5df4bff6d1471cb976cb781c95a385"
+                        }
+                      }
+                    }
+                  },
+                  "INSUFFICIENT_INVENTORY_CHECKOUT": {
+                    "summary": "Stock ran out before checkout",
+                    "value": {
+                      "error": {
+                        "code": "INSUFFICIENT_INVENTORY",
+                        "message": "Not enough inventory for one or more items",
+                        "details": {
+                          "items": [
+                            {
+                              "product_id": "p_lamp",
+                              "requested": 3,
+                              "available": 2
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  },
+                  "COUPON_ALREADY_REDEEMED": {
+                    "summary": "Coupon already used by another order",
+                    "value": {
+                      "error": {
+                        "code": "COUPON_ALREADY_REDEEMED",
+                        "message": "Coupon has already been redeemed",
+                        "details": {}
+                      }
+                    }
+                  },
+                  "TOTAL_CHANGED": {
+                    "summary": "Total differs from expected_total_minor",
+                    "value": {
+                      "error": {
+                        "code": "TOTAL_CHANGED",
+                        "message": "Order total differs from what the client expected",
+                        "details": {
+                          "expected_total_minor": 10997,
+                          "subtotal_minor": 11497,
+                          "discount_minor": 0,
+                          "total_minor": 11497
+                        }
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "CART_EMPTY": {
+                    "summary": "Nothing to check out",
+                    "value": {
+                      "error": {
+                        "code": "CART_EMPTY",
+                        "message": "Cannot check out an empty cart",
+                        "details": {}
+                      }
+                    }
+                  },
+                  "COUPON_NOT_FOUND": {
+                    "summary": "Unknown coupon code",
+                    "value": {
+                      "error": {
+                        "code": "COUPON_NOT_FOUND",
+                        "message": "Coupon code is not valid",
+                        "details": {}
+                      }
+                    }
+                  },
+                  "VALIDATION_ERROR_EXTRA": {
+                    "summary": "Unknown field in the body",
+                    "value": {
+                      "error": {
+                        "code": "VALIDATION_ERROR",
+                        "message": "Request body is invalid",
+                        "details": {
+                          "errors": [
+                            {
+                              "type": "extra_forbidden",
+                              "loc": [
+                                "body",
+                                "coupon"
+                              ],
+                              "msg": "Extra inputs are not permitted",
+                              "input": "SAVE-7F3A9C21"
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/orders/{order_id}": {
+      "get": {
+        "tags": [
+          "Checkout & orders"
+        ],
+        "summary": "Get an order",
+        "description": "Orders never change after they're placed. Names and prices are copies from checkout time,\nso they still explain the total after the catalogue changes.",
+        "operationId": "get_order_orders__order_id__get",
+        "parameters": [
+          {
+            "name": "order_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Order ID.",
+              "examples": [
+                "bb5df4bff6d1471cb976cb781c95a385"
+              ],
+              "title": "Order Id"
+            },
+            "description": "Order ID."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The order exactly as placed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Order"
+                },
+                "examples": {
+                  "coupon": {
+                    "summary": "Order with a coupon",
+                    "value": {
+                      "id": "bb5df4bff6d1471cb976cb781c95a385",
+                      "cart_id": "b685d68c87cb40ffbb3c88af5c8cdfad",
+                      "subtotal_minor": 10997,
+                      "coupon_code": "SAVE-7F3A9C21",
+                      "discount_percent": 10,
+                      "discount_minor": 1100,
+                      "total_minor": 9897,
+                      "currency": "INR",
+                      "created_at": "2026-10-06T18:26:10.303402Z",
+                      "lines": [
+                        {
+                          "product_id": "p_cable",
+                          "product_name": "USB-C Cable",
+                          "unit_price_minor": 999,
+                          "quantity": 2,
+                          "line_total_minor": 1998
+                        },
+                        {
+                          "product_id": "p_keyboard",
+                          "product_name": "Mechanical Keyboard",
+                          "unit_price_minor": 8999,
+                          "quantity": 1,
+                          "line_total_minor": 8999
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "ORDER_NOT_FOUND": {
+                    "summary": "Unknown order ID",
+                    "value": {
+                      "error": {
+                        "code": "ORDER_NOT_FOUND",
+                        "message": "Order 7c1e9a3f5b2d4e6a8c0b1d3f5e7a9c2b does not exist",
+                        "details": {}
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/coupons": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "List coupons",
+        "operationId": "list_coupons_admin_coupons_get",
+        "responses": {
+          "200": {
+            "description": "All coupons, oldest milestone first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/Coupon"
+                  },
+                  "type": "array",
+                  "title": "Response List Coupons Admin Coupons Get"
+                },
+                "examples": {
+                  "coupons": {
+                    "summary": "One redeemed, one available",
+                    "value": [
+                      {
+                        "code": "SAVE-7F3A9C21",
+                        "percent": 10,
+                        "milestone_order": 5,
+                        "created_at": "2026-10-06T18:26:10.303402Z",
+                        "redeemed_order_id": "bb5df4bff6d1471cb976cb781c95a385",
+                        "status": "redeemed"
+                      },
+                      {
+                        "code": "SAVE-2B8E40D6",
+                        "percent": 10,
+                        "milestone_order": 10,
+                        "created_at": "2026-10-06T19:02:44.918204Z",
+                        "status": "available"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Generate a coupon",
+        "description": "Issues **one** coupon for the oldest milestone that has been reached but not rewarded yet.\nWith n = 5, milestones fall at orders 5, 10, 15, and so on; every placed order counts, including discounted ones.\nIf several milestones are owed, call again for each. Concurrent calls can never issue two coupons for the same milestone.\n\nThe coupon gets the current x%, which stays fixed even if the configuration changes later. After a change to n,\nthe next milestone is `last rewarded + n`.",
+        "operationId": "generate_coupon_admin_coupons_post",
+        "responses": {
+          "201": {
+            "description": "Coupon issued for the oldest unrewarded milestone.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Coupon"
+                },
+                "examples": {
+                  "issued": {
+                    "summary": "Coupon for order milestone 5",
+                    "value": {
+                      "code": "SAVE-7F3A9C21",
+                      "percent": 10,
+                      "milestone_order": 5,
+                      "created_at": "2026-10-06T18:26:10.303402Z",
+                      "status": "available"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict with current state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "examples": {
+                  "NO_ELIGIBLE_MILESTONE": {
+                    "summary": "No unrewarded milestone reached yet",
+                    "value": {
+                      "error": {
+                        "code": "NO_ELIGIBLE_MILESTONE",
+                        "message": "No unrewarded order milestone has been reached",
+                        "details": {
+                          "orders_placed": 7,
+                          "next_milestone_order": 10
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/report": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Sales and coupon report",
+        "description": "Read-only, so repeated calls never change state. All figures come from one database snapshot, so they always agree:\n`net = gross \u2212 discounts = \u03a3 order totals` and `coupons.generated = available + redeemed`.",
+        "operationId": "report_admin_report_get",
+        "responses": {
+          "200": {
+            "description": "Totals derived from placed orders and coupons.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Report"
+                },
+                "examples": {
+                  "report": {
+                    "summary": "After 6 orders",
+                    "value": {
+                      "orders_placed": 6,
+                      "quantity_by_product": [
+                        {
+                          "product_id": "p_cable",
+                          "name": "USB-C Cable",
+                          "quantity_sold": 7
+                        },
+                        {
+                          "product_id": "p_keyboard",
+                          "name": "Mechanical Keyboard",
+                          "quantity_sold": 2
+                        },
+                        {
+                          "product_id": "p_lamp",
+                          "name": "Limited Edition Desk Lamp",
+                          "quantity_sold": 1
+                        },
+                        {
+                          "product_id": "p_monitor",
+                          "name": "27in Monitor",
+                          "quantity_sold": 1
+                        },
+                        {
+                          "product_id": "p_mouse",
+                          "name": "Wireless Mouse",
+                          "quantity_sold": 2
+                        }
+                      ],
+                      "revenue": [
+                        {
+                          "currency": "INR",
+                          "gross_revenue_minor": 72987,
+                          "discounts_minor": 1100,
+                          "net_revenue_minor": 71887
+                        }
+                      ],
+                      "coupons": {
+                        "generated": 1,
+                        "redeemed": 1,
+                        "available": 0
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/products/{product_id}": {
+      "patch": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Change a product's price or stock",
+        "description": "Use this to see what happens when the catalogue changes under an open cart. Open carts\nshow the new price immediately. Placed orders keep the price they were charged.",
+        "operationId": "update_product_admin_products__product_id__patch",
+        "parameters": [
+          {
+            "name": "product_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Product ID, e.g. `p_keyboard`.",
+              "examples": [
+                "p_keyboard"
+              ],
+              "title": "Product Id"
+            },
+            "description": "Product ID, e.g. `p_keyboard`."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProductPatch"
+              },
+              "examples": {
+                "price": {
+                  "summary": "Change the price",
+                  "value": {
+                    "price_minor": 9499
+                  }
+                },
+                "stock": {
+                  "summary": "Set stock level",
+                  "value": {
+                    "inventory": 2
+                  }
+                },
+                "both": {
+                  "summary": "Price and stock together",
+                  "value": {
+                    "price_minor": 9499,
+                    "currency": "INR",
+                    "inventory": 40
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The updated product.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Product"
+                },
+                "examples": {
+                  "price": {
+                    "summary": "Keyboard repriced",
+                    "value": {
+                      "id": "p_keyboard",
+                      "name": "Mechanical Keyboard",
+                      "price_minor": 9499,
+                      "currency": "INR",
+                      "inventory": 50
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "PRODUCT_NOT_FOUND": {
+                    "summary": "Unknown product ID",
+                    "value": {
+                      "error": {
+                        "code": "PRODUCT_NOT_FOUND",
+                        "message": "Product p_speaker does not exist",
+                        "details": {}
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "examples": {
+                  "VALIDATION_ERROR_EXTRA": {
+                    "summary": "Unknown field in the body",
+                    "value": {
+                      "error": {
+                        "code": "VALIDATION_ERROR",
+                        "message": "Request body is invalid",
+                        "details": {
+                          "errors": [
+                            {
+                              "type": "extra_forbidden",
+                              "loc": [
+                                "body",
+                                "coupon"
+                              ],
+                              "msg": "Extra inputs are not permitted",
+                              "input": "SAVE-7F3A9C21"
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AddItem": {
+        "properties": {
+          "product_id": {
+            "type": "string",
+            "title": "Product Id",
+            "description": "ID of an existing product, e.g. `p_keyboard`."
+          },
+          "quantity": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Quantity",
+            "description": "Whole units, 1\u20131000. Must be a JSON integer: `1.5` and `\"2\"` are rejected."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "product_id",
+          "quantity"
+        ],
+        "title": "AddItem"
+      },
+      "Cart": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "checked_out"
+            ],
+            "title": "Status"
+          },
+          "order_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Order Id",
+            "description": "The order this cart became, once checked out."
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CartItem"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "subtotal_minor": {
+            "type": "integer",
+            "title": "Subtotal Minor",
+            "description": "Sum of line totals at current prices, before any coupon."
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency",
+            "description": "ISO 4217 code all amounts on this object are in, e.g. `INR`. Amounts are integers in its minor unit: paise for INR, cents for USD, yen for JPY."
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "status",
+          "order_id",
+          "items",
+          "subtotal_minor",
+          "currency"
+        ],
+        "title": "Cart"
+      },
+      "CartItem": {
+        "properties": {
+          "product_id": {
+            "type": "string",
+            "title": "Product Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "unit_price_minor": {
+            "type": "integer",
+            "title": "Unit Price Minor",
+            "description": "The product's **current** price; not locked in until checkout."
+          },
+          "quantity": {
+            "type": "integer",
+            "title": "Quantity"
+          },
+          "line_total_minor": {
+            "type": "integer",
+            "title": "Line Total Minor",
+            "description": "`unit_price_minor \u00d7 quantity`."
+          },
+          "available_inventory": {
+            "type": "integer",
+            "title": "Available Inventory",
+            "description": "Current stock. Carts don't reserve stock."
+          },
+          "in_stock": {
+            "type": "boolean",
+            "title": "In Stock",
+            "description": "`quantity <= available_inventory` right now. Checkout re-checks."
+          }
+        },
+        "type": "object",
+        "required": [
+          "product_id",
+          "name",
+          "unit_price_minor",
+          "quantity",
+          "line_total_minor",
+          "available_inventory",
+          "in_stock"
+        ],
+        "title": "CartItem"
+      },
+      "CheckoutBody": {
+        "properties": {
+          "coupon_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Coupon Code",
+            "description": "Optional coupon from `POST /admin/coupons`. Unknown or used codes fail the checkout."
+          },
+          "expected_total_minor": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Total Minor",
+            "description": "Optional. The total the client showed the customer. If the real total differs (price changed, coupon changed), checkout fails with `409 TOTAL_CHANGED` and nothing is written."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "CheckoutBody"
+      },
+      "Coupon": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code"
+          },
+          "percent": {
+            "type": "integer",
+            "title": "Percent",
+            "description": "Discount this coupon gives. Fixed when issued; later config changes don't affect it."
+          },
+          "milestone_order": {
+            "type": "integer",
+            "title": "Milestone Order",
+            "description": "The order count that earned this coupon, e.g. 5, 10, 15."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "redeemed_order_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Redeemed Order Id",
+            "description": "The order that used this coupon, if any."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "available",
+              "redeemed"
+            ],
+            "title": "Status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "percent",
+          "milestone_order",
+          "created_at",
+          "redeemed_order_id",
+          "status"
+        ],
+        "title": "Coupon"
+      },
+      "CouponCounts": {
+        "properties": {
+          "generated": {
+            "type": "integer",
+            "title": "Generated"
+          },
+          "redeemed": {
+            "type": "integer",
+            "title": "Redeemed"
+          },
+          "available": {
+            "type": "integer",
+            "title": "Available",
+            "description": "`generated \u2212 redeemed`."
+          }
+        },
+        "type": "object",
+        "required": [
+          "generated",
+          "redeemed",
+          "available"
+        ],
+        "title": "CouponCounts"
+      },
+      "ErrorBody": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code",
+            "description": "Stable, machine-readable error code. Branch on this, not on `message`."
+          },
+          "message": {
+            "type": "string",
+            "title": "Message",
+            "description": "Human-readable explanation."
+          },
+          "details": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Details",
+            "description": "Structured data the client can act on; `{}` when there is none."
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "details"
+        ],
+        "title": "ErrorBody"
+      },
+      "ErrorResponse": {
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorBody"
+          }
+        },
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "title": "ErrorResponse"
+      },
+      "Order": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "cart_id": {
+            "type": "string",
+            "title": "Cart Id"
+          },
+          "subtotal_minor": {
+            "type": "integer",
+            "title": "Subtotal Minor",
+            "description": "Sum of `lines[].line_total_minor`."
+          },
+          "coupon_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Coupon Code"
+          },
+          "discount_percent": {
+            "type": "integer",
+            "title": "Discount Percent",
+            "description": "Taken from the coupon when it was issued; 0 without a coupon."
+          },
+          "discount_minor": {
+            "type": "integer",
+            "title": "Discount Minor",
+            "description": "`round_half_up(subtotal \u00d7 percent / 100)`, never above the subtotal."
+          },
+          "total_minor": {
+            "type": "integer",
+            "title": "Total Minor",
+            "description": "`subtotal_minor \u2212 discount_minor`, always \u2265 0."
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency",
+            "description": "ISO 4217 code the order was priced in, copied at checkout. It never changes, even if the store's currency does."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "lines": {
+            "items": {
+              "$ref": "#/components/schemas/OrderLine"
+            },
+            "type": "array",
+            "title": "Lines"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "cart_id",
+          "subtotal_minor",
+          "coupon_code",
+          "discount_percent",
+          "discount_minor",
+          "total_minor",
+          "currency",
+          "created_at",
+          "lines"
+        ],
+        "title": "Order"
+      },
+      "OrderLine": {
+        "properties": {
+          "product_id": {
+            "type": "string",
+            "title": "Product Id"
+          },
+          "product_name": {
+            "type": "string",
+            "title": "Product Name",
+            "description": "Snapshot of the product name at checkout."
+          },
+          "unit_price_minor": {
+            "type": "integer",
+            "title": "Unit Price Minor",
+            "description": "Snapshot of the price charged at checkout."
+          },
+          "quantity": {
+            "type": "integer",
+            "title": "Quantity"
+          },
+          "line_total_minor": {
+            "type": "integer",
+            "title": "Line Total Minor"
+          }
+        },
+        "type": "object",
+        "required": [
+          "product_id",
+          "product_name",
+          "unit_price_minor",
+          "quantity",
+          "line_total_minor"
+        ],
+        "title": "OrderLine"
+      },
+      "Product": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "price_minor": {
+            "type": "integer",
+            "title": "Price Minor",
+            "description": "Current unit price in minor units."
+          },
+          "currency": {
+            "type": "string",
+            "title": "Currency",
+            "description": "ISO 4217 code all amounts on this object are in, e.g. `INR`. Amounts are integers in its minor unit: paise for INR, cents for USD, yen for JPY."
+          },
+          "inventory": {
+            "type": "integer",
+            "title": "Inventory",
+            "description": "Units available right now."
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "price_minor",
+          "currency",
+          "inventory"
+        ],
+        "title": "Product"
+      },
+      "ProductPatch": {
+        "properties": {
+          "price_minor": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price Minor",
+            "description": "New unit price in minor units. Omit to keep."
+          },
+          "inventory": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inventory",
+            "description": "New absolute stock level. Omit to keep."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ProductPatch"
+      },
+      "ProductSales": {
+        "properties": {
+          "product_id": {
+            "type": "string",
+            "title": "Product Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "quantity_sold": {
+            "type": "integer",
+            "title": "Quantity Sold"
+          }
+        },
+        "type": "object",
+        "required": [
+          "product_id",
+          "name",
+          "quantity_sold"
+        ],
+        "title": "ProductSales"
+      },
+      "Report": {
+        "properties": {
+          "orders_placed": {
+            "type": "integer",
+            "title": "Orders Placed"
+          },
+          "quantity_by_product": {
+            "items": {
+              "$ref": "#/components/schemas/ProductSales"
+            },
+            "type": "array",
+            "title": "Quantity By Product"
+          },
+          "revenue": {
+            "items": {
+              "$ref": "#/components/schemas/Revenue"
+            },
+            "type": "array",
+            "title": "Revenue",
+            "description": "One entry per currency that orders were placed in. Normally a single entry; more only if the store's currency was changed. Amounts in different currencies are never added together."
+          },
+          "coupons": {
+            "$ref": "#/components/schemas/CouponCounts"
+          }
+        },
+        "type": "object",
+        "required": [
+          "orders_placed",
+          "quantity_by_product",
+          "revenue",
+          "coupons"
+        ],
+        "title": "Report"
+      },
+      "Revenue": {
+        "properties": {
+          "currency": {
+            "type": "string",
+            "title": "Currency"
+          },
+          "gross_revenue_minor": {
+            "type": "integer",
+            "title": "Gross Revenue Minor",
+            "description": "Sum of order subtotals in this currency (before discounts)."
+          },
+          "discounts_minor": {
+            "type": "integer",
+            "title": "Discounts Minor",
+            "description": "Sum of order discounts in this currency."
+          },
+          "net_revenue_minor": {
+            "type": "integer",
+            "title": "Net Revenue Minor",
+            "description": "`gross \u2212 discounts`, equal to the sum of order totals in this currency."
+          }
+        },
+        "type": "object",
+        "required": [
+          "currency",
+          "gross_revenue_minor",
+          "discounts_minor",
+          "net_revenue_minor"
+        ],
+        "title": "Revenue"
+      },
+      "SetQuantity": {
+        "properties": {
+          "quantity": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Quantity",
+            "description": "Whole units, 1\u20131000. Must be a JSON integer: `1.5` and `\"2\"` are rejected."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "quantity"
+        ],
+        "title": "SetQuantity"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "Products",
+      "description": "The catalogue: current prices and stock."
+    },
+    {
+      "name": "Carts",
+      "description": "Build a cart. Carts hold product IDs and quantities only; they don't reserve stock."
+    },
+    {
+      "name": "Checkout & orders",
+      "description": "Turn a cart into an immutable order, optionally with a coupon."
+    },
+    {
+      "name": "Admin",
+      "description": "Administrative operations: coupons, reporting, and product changes."
+    }
+  ]
+}
